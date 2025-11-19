@@ -1,0 +1,14 @@
+[Unit]
+Description=Tape Vault Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/V-library
+ExecStart=/usr/bin/python3 /opt/V-library/src/tapevault.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
