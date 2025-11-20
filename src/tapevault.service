@@ -1,14 +1,34 @@
 [Unit]
+<<<<<<< HEAD
 Description=Tape Vault Service
+=======
+Description=Tape Vault FUSE Filesystem
+>>>>>>> 49c01da (Add tapevault.py and tapevault.service files)
 After=network.target
 
 [Service]
 Type=simple
+<<<<<<< HEAD
 User=root
 WorkingDirectory=/opt/V-library
 ExecStart=/usr/bin/python3 /opt/V-library/src/tapevault.py
 Restart=always
 RestartSec=10
+=======
+Environment=CHANGER_DEVICE=/dev/sg1
+Environment=TAPE_DEVICE=/dev/st0
+Environment=DB_PATH=/var/lib/tapevault/tapevault.db
+Environment=TEMP_MOUNT_BASE=/tmp/ltfs_mounts
+# Ensure python output is unbuffered so logs show up immediately in journal
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/V-library/tapevault.py --mount-point /mnt/tape-vault
+ExecStop=/bin/fusermount -u /mnt/tape-vault
+# Tapes are slow. Allow unlimited time for startup (inventory/indexing) and ample time for stop.
+TimeoutStartSec=infinity
+TimeoutStopSec=600
+Restart=on-failure
+User=root
+>>>>>>> 49c01da (Add tapevault.py and tapevault.service files)
 
 [Install]
 WantedBy=multi-user.target

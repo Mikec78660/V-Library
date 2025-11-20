@@ -249,7 +249,7 @@ class TapeVault(Operations):
         if row:
             return dict(st_mode=(S_IFREG | 0o444), st_nlink=1, st_size=row['size'], st_mtime=row['mtime'])
             
-        c.execute("SELECT 1 FROM files WHERE path GLOB ? LIMIT 1", (clean_path + '/*',))
+        c.execute("SELECT 1 FROM files WHERE path LIKE ? LIMIT 1", (clean_path + '/%',))
         if c.fetchone():
              return dict(st_mode=(S_IFDIR | 0o755), st_nlink=2)
              
@@ -264,7 +264,7 @@ class TapeVault(Operations):
             prefix = ""
             
         c = self.conn.cursor()
-        c.execute("SELECT path FROM files WHERE path GLOB ?", (prefix + '*',))
+        c.execute("SELECT path FROM files WHERE path LIKE ?", (prefix + '%',))
         
         seen = set()
         for row in c.fetchall():
@@ -377,33 +377,195 @@ def index():
     tapes = conn.execute('SELECT * FROM tapes').fetchall()
     conn.close()
     
+    # Calculate total stats
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT SUM(total_space), SUM(free_space) FROM tapes")
+    row = c.fetchone()
+    total_capacity = row[0] if row[0] else 0
+    total_free = row[1] if row[1] else 0
+    conn.close()
+    
     html = """
     <html>
-    <head><title>Tape Vault</title></head>
+    <head>
+        <title>Tape Vault</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; }
+            table { border-collapse: collapse; width: 100%; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background-color: #f2f2f2; }
+            .volume-tag { cursor: pointer; color: #0066cc; text-decoration: underline; }
+            .volume-tag:hover { color: #004499; }
+            .file-tree { margin-left: 20px; display: none; }
+            .file-tree ul { list-style-type: none; padding-left: 20px; }
+            .file-tree li { margin: 2px 0; }
+            .directory { cursor: pointer; color: #0066cc; font-weight: bold; }
+            .directory:hover { color: #004499; }
+            .file { color: #333; }
+            .disk-usage { 
+                background: linear-gradient(to right, #4CAF50 var(--used-percent), #e0e0e0 var(--used-percent)); 
+                border-radius: 4px; 
+                height: 20px; 
+                position: relative;
+                margin: 2px 0;
+            }
+            .disk-usage-text { 
+                position: absolute; 
+                top: 50%; 
+                left: 50%; 
+                transform: translate(-50%, -50%); 
+                font-size: 12px;
+                color: white;
+                text-shadow: 1px 1px 1px rgba(0,0,0,0.5);
+            }
+            .loading { color: #666; font-style: italic; }
+            .summary { margin-bottom: 20px; padding: 15px; background-color: #f8f9fa; border: 1px solid #ddd; border-radius: 4px; }
+        </style>
+        <script>
+            function toggleVolumeTag(volTag) {
+                const fileTree = document.getElementById('files-' + volTag);
+                const tag = document.getElementById('tag-' + volTag);
+                
+                if (fileTree.style.display === 'none' || fileTree.style.display === '') {
+                    fileTree.innerHTML = '<div class="loading">Loading...</div>';
+                    fileTree.style.display = 'block';
+                    tag.style.color = '#004499';
+                    
+                    fetch('/api/files/' + volTag)
+                        .then(response => response.json())
+                        .then(data => {
+                            displayFileTree(volTag, data.files, '');
+                        })
+                        .catch(error => {
+                            fileTree.innerHTML = '<div style="color: red;">Error loading files</div>';
+                        });
+                } else {
+                    fileTree.style.display = 'none';
+                    tag.style.color = '#0066cc';
+                }
+            }
+            
+            function displayFileTree(volTag, files, currentPath) {
+                const fileTree = document.getElementById('files-' + volTag);
+                const pathPrefix = currentPath ? currentPath + '/' : '';
+                
+                const directories = {};
+                const directFiles = [];
+                
+                files.forEach(file => {
+                    if (file.path.startsWith(pathPrefix)) {
+                        const relativePath = file.path.substring(pathPrefix.length);
+                        const parts = relativePath.split('/');
+                        
+                        if (parts.length === 1) {
+                            directFiles.push(file);
+                        } else {
+                            const dirName = parts[0];
+                            if (!directories[dirName]) {
+                                directories[dirName] = [];
+                            }
+                            directories[dirName].push(file);
+                        }
+                    }
+                });
+                
+                let html = '<ul>';
+                
+                Object.keys(directories).sort().forEach(dirName => {
+                    html += '<li><span class="directory" onclick="toggleDirectory(\\\'' + volTag + '\\\', \\\'' + pathPrefix + dirName + '\\\')">' + dirName + '/</span>';
+                    html += '<div id="dir-' + volTag + '-' + btoa(pathPrefix + dirName) + '" class="file-tree" style="display: none;"></div></li>';
+                });
+                
+                directFiles.forEach(file => {
+                    const fileName = file.path.split('/').pop();
+                    html += '<li class="file">' + fileName + ' (' + formatFileSize(file.size) + ')</li>';
+                });
+                
+                html += '</ul>';
+                fileTree.innerHTML = html;
+            }
+            
+            function toggleDirectory(volTag, dirPath) {
+                const dirId = 'dir-' + volTag + '-' + btoa(dirPath);
+                const dirElement = document.getElementById(dirId);
+                
+                if (dirElement.style.display === 'none' || dirElement.style.display === '') {
+                    dirElement.innerHTML = '<div class="loading">Loading...</div>';
+                    dirElement.style.display = 'block';
+                    
+                    fetch('/api/files/' + volTag + '?path=' + encodeURIComponent(dirPath))
+                        .then(response => response.json())
+                        .then(data => {
+                            displayFileTree(volTag, data.files, dirPath);
+                        })
+                        .catch(error => {
+                            dirElement.innerHTML = '<div style="color: red;">Error loading directory</div>';
+                        });
+                } else {
+                    dirElement.style.display = 'none';
+                }
+            }
+            
+            function formatFileSize(bytes) {
+                if (bytes === 0) return '0 B';
+                const k = 1024;
+                const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(k));
+                return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+            }
+        </script>
+    </head>
     <body>
         <h1>Tape Vault</h1>
+        
+        <div class="summary">
+            <h3>System Status</h3>
+            <p><strong>Total Capacity:</strong> {{ total_capacity | filesizeformat }}</p>
+            <p><strong>Total Free Space:</strong> {{ total_free | filesizeformat }}</p>
+        </div>
+
         <table border="1">
             <tr>
                 <th>Volume Tag</th>
-                <th>Total Space</th>
-                <th>Free Space</th>
+                <th>Disk Usage</th>
+                <th>Space Details</th>
                 <th>Last Seen</th>
                 <th>Actions</th>
             </tr>
             {% for tape in tapes %}
             <tr>
-                <td><a href="/browse/{{ tape.vol_tag }}/">{{ tape.vol_tag }}</a></td>
-                <td>{{ tape.total_space | filesizeformat }}</td>
-                <td>{{ tape.free_space | filesizeformat }}</td>
+                <td>
+                    <span id="tag-{{ tape.vol_tag }}" class="volume-tag" onclick="toggleVolumeTag('{{ tape.vol_tag }}')">
+                        {{ tape.vol_tag }}
+                    </span>
+                </td>
+                <td>
+                    {% set used_space = tape.total_space - tape.free_space %}
+                    {% set used_percent = (used_space / tape.total_space * 100) if tape.total_space > 0 else 0 %}
+                    <div class="disk-usage" style="--used-percent: {{ used_percent }}%">
+                        <div class="disk-usage-text">{{ "%.1f"|format(used_percent) }}% used</div>
+                    </div>
+                </td>
+                <td>
+                    Total: {{ "%0.1f"|format((tape.total_space / (1024*1024*1024))) }} GB<br>
+                    Used: {{ "%0.1f"|format(((tape.total_space - tape.free_space) / (1024*1024*1024))) }} GB<br>
+                    Free: {{ "%0.1f"|format((tape.free_space / (1024*1024*1024))) }} GB
+                </td>
                 <td>{{ tape.last_seen }}</td>
                 <td><a href="/delete/{{ tape.vol_tag }}">Delete</a></td>
+            </tr>
+            <tr>
+                <td colspan="5" style="padding: 0;">
+                    <div id="files-{{ tape.vol_tag }}" class="file-tree"></div>
+                </td>
             </tr>
             {% endfor %}
         </table>
     </body>
     </html>
     """
-    return render_template_string(html, tapes=tapes)
+    return render_template_string(html, tapes=tapes, total_capacity=total_capacity, total_free=total_free)
 
 @app.route('/browse/<vol_tag>/')
 @app.route('/browse/<vol_tag>/<path:subpath>')
@@ -424,7 +586,7 @@ def browse(vol_tag, subpath=""):
     # Find direct children in this tape
     # We use the same logic as readdir but filtered by vol_tag
     c = conn.cursor()
-    c.execute("SELECT path, size FROM files WHERE vol_tag=? AND path GLOB ?", (vol_tag, prefix + '*'))
+    c.execute("SELECT path, size FROM files WHERE vol_tag=? AND path LIKE ?", (vol_tag, prefix + '%'))
     
     files = []
     dirs = set()
@@ -470,6 +632,27 @@ def delete_tape(vol_tag):
     conn.commit()
     conn.close()
     return redirect(url_for('index'))
+
+@app.route('/api/files/<vol_tag>')
+def api_files(vol_tag):
+    conn = get_db_connection()
+    path = request.args.get('path', '')
+    
+    if path:
+        prefix = path + '/'
+    else:
+        prefix = ""
+    
+    c = conn.cursor()
+    c.execute("SELECT path, size FROM files WHERE vol_tag=? AND path LIKE ?", (vol_tag, prefix + '%'))
+    
+    files = []
+    for row in c.fetchall():
+        files.append({'path': row['path'], 'size': row['size']})
+    
+    conn.close()
+    
+    return {'files': files}
 
 def start_web_server():
     app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)
