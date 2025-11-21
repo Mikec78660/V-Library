@@ -9,6 +9,7 @@ import logging
 import argparse
 import threading
 import errno
+import signal
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 from stat import S_IFDIR, S_IFREG
 from flask import Flask, render_template_string, request, redirect, url_for
@@ -19,11 +20,18 @@ TAPE_DEVICE = os.environ.get('TAPE_DEVICE', '/dev/st0')
 DB_PATH = os.environ.get('DB_PATH', '/var/lib/tapevault/tapevault.db')
 TEMP_MOUNT_BASE = os.environ.get('TEMP_MOUNT_BASE', '/tmp/ltfs_mounts')
 WEB_PORT = int(os.environ.get('WEB_PORT', 5002))
+# Default cache limit 50GB, can be overridden
+# CACHE_SIZE_LIMIT is in GB
+CACHE_SIZE_LIMIT_GB = int(os.environ.get('CACHE_SIZE_LIMIT', 50))
+CACHE_SIZE_LIMIT = CACHE_SIZE_LIMIT_GB * 1024 * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 log = logging.getLogger('tapevault')
 
 app = Flask(__name__)
+
+# Global lock for tape operations
+TAPE_LOCK = threading.Lock()
 
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -42,9 +50,6 @@ def init_db():
     try:
         c.execute("SELECT total_space FROM tapes LIMIT 1")
     except sqlite3.OperationalError:
-        # Table might not exist or column missing. 
-        # Simplest is to drop and recreate if we want to enforce schema, 
-        # but to be safe let's just create if not exists and then try to alter.
         pass
 
     c.execute('''CREATE TABLE IF NOT EXISTS tapes (
@@ -54,7 +59,6 @@ def init_db():
                     free_space INTEGER DEFAULT 0
                 )''')
     
-    # Try adding columns if they don't exist (for migration)
     try:
         c.execute("ALTER TABLE tapes ADD COLUMN total_space INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
@@ -117,6 +121,82 @@ def parse_mtx_status():
             continue
 
     return tapes, drive_loaded
+
+def is_mounted(vol_tag):
+    """Check if a volume is currently mounted."""
+    mount_point = os.path.join(TEMP_MOUNT_BASE, vol_tag)
+    return os.path.ismount(mount_point)
+
+def get_cached_files():
+    """
+    Return a list of cached files with their details.
+    Returns: list of dicts: {'path': str, 'size': int, 'atime': float}
+    """
+    cache_root = os.path.join(TEMP_MOUNT_BASE, 'cache')
+    cached_files = []
+    if not os.path.exists(cache_root):
+        return cached_files
+        
+    for root, dirs, files in os.walk(cache_root):
+        for name in files:
+            fpath = os.path.join(root, name)
+            try:
+                st = os.stat(fpath)
+                # Rel path from cache root
+                rel_path = os.path.relpath(fpath, cache_root)
+                cached_files.append({
+                    'path': rel_path,
+                    'full_path': fpath,
+                    'size': st.st_size,
+                    'atime': st.st_atime
+                })
+            except OSError:
+                pass
+    return cached_files
+
+def enforce_cache_limit(needed_bytes):
+    """
+    Enforce cache size limit.
+    If current_usage + needed_bytes > max(CACHE_SIZE_LIMIT, needed_bytes),
+    evict least recently accessed files until it fits.
+    """
+    cached_files = get_cached_files()
+    current_usage = sum(f['size'] for f in cached_files)
+    
+    # The effective limit is the configured limit, UNLESS the requested file is larger than the limit,
+    # in which case we must allow at least that file.
+    effective_limit = max(CACHE_SIZE_LIMIT, needed_bytes)
+    
+    if current_usage + needed_bytes <= effective_limit:
+        return
+        
+    # Sort by atime (oldest first)
+    cached_files.sort(key=lambda x: x['atime'])
+    
+    freed = 0
+    target_usage = effective_limit - needed_bytes
+    
+    log.info(f"Enforcing cache limit. Current: {current_usage}, Needed: {needed_bytes}, Limit: {effective_limit}. Target usage: {target_usage}")
+    
+    for f in cached_files:
+        if current_usage - freed <= target_usage:
+            break
+            
+        try:
+            log.info(f"Evicting {f['path']} (Size: {f['size']})")
+            os.remove(f['full_path'])
+            freed += f['size']
+            
+            # Also try to remove empty parent directories
+            d = os.path.dirname(f['full_path'])
+            while d != os.path.join(TEMP_MOUNT_BASE, 'cache'):
+                try:
+                    os.rmdir(d)
+                    d = os.path.dirname(d)
+                except OSError:
+                    break
+        except OSError as e:
+            log.error(f"Failed to evict {f['path']}: {e}")
 
 def inventory_and_index():
     """
@@ -235,7 +315,8 @@ class TapeVault(Operations):
     def __init__(self):
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.tape_lock = threading.Lock()
+        # Use global lock
+        self.tape_lock = TAPE_LOCK
         
     def getattr(self, path, fh=None):
         if path == '/':
@@ -288,50 +369,67 @@ class TapeVault(Operations):
             raise FuseOSError(errno.ENOENT)
             
         vol_tag = rows[0]['vol_tag']
+        file_size = rows[0]['size']
         cache_path = os.path.join(TEMP_MOUNT_BASE, 'cache', vol_tag, clean_path)
         if os.path.exists(cache_path):
+            # Update atime
+            os.utime(cache_path, None)
             return os.open(cache_path, flags)
             
-        self.fetch_file(vol_tag, clean_path)
+        self.fetch_file(vol_tag, clean_path, file_size)
         if not os.path.exists(cache_path):
              # If fetch_file returned but file is still missing, something went wrong
              raise FuseOSError(errno.EIO)
         return os.open(cache_path, flags)
 
-    def fetch_file(self, vol_tag, rel_path):
+    def fetch_file(self, vol_tag, rel_path, file_size=0):
         with self.tape_lock:
             cache_path = os.path.join(TEMP_MOUNT_BASE, 'cache', vol_tag, rel_path)
             if os.path.exists(cache_path):
                 return
 
             log.info(f"Fetching file {vol_tag}/{rel_path}...")
-            tapes_in_library, drive_loaded = parse_mtx_status()
             
-            slot_id = None
-            for s, v in tapes_in_library.items():
-                if v == vol_tag:
-                    slot_id = s
-                    break
-            
-            in_drive = (drive_loaded and drive_loaded['vol_tag'] == vol_tag)
-            
-            if not in_drive and not slot_id:
-                log.error(f"Tape {vol_tag} not found for fetching file!")
-                return
-
-            if not in_drive:
-                log.info("Unloading current tape...")
-                run_command(f"mtx -f {CHANGER_DEVICE} unload || true")
-                log.info(f"Loading tape {vol_tag} from slot {slot_id}...")
-                run_command(f"mtx -f {CHANGER_DEVICE} load {slot_id} 0")
+            # Enforce cache limit before fetching
+            enforce_cache_limit(file_size)
             
             mount_point = os.path.join(TEMP_MOUNT_BASE, vol_tag)
-            if not os.path.exists(mount_point):
-                os.makedirs(mount_point)
+            already_mounted = is_mounted(vol_tag)
+            we_mounted_it = False
+            
+            
+            if not already_mounted:
+                tapes_in_library, drive_loaded = parse_mtx_status()
+                
+                slot_id = None
+                for s, v in tapes_in_library.items():
+                    if v == vol_tag:
+                        slot_id = s
+                        break
+                
+                in_drive = (drive_loaded and drive_loaded['vol_tag'] == vol_tag)
+                
+                if not in_drive and not slot_id:
+                    log.error(f"Tape {vol_tag} not found for fetching file!")
+                    return
+
+                if not in_drive:
+                    log.info("Unloading current tape...")
+                    run_command(f"mtx -f {CHANGER_DEVICE} unload || true")
+                    log.info(f"Loading tape {vol_tag} from slot {slot_id}...")
+                    run_command(f"mtx -f {CHANGER_DEVICE} load {slot_id} 0")
+                
+                if not os.path.exists(mount_point):
+                    os.makedirs(mount_point)
+                
+                log.info(f"Mounting {vol_tag}...")
+                run_command(f"ltfs -o devname={TAPE_DEVICE} {mount_point}")
+                we_mounted_it = True
+            else:
+                # If it was already mounted, we assume it might be mounted by the UI or another process.
+                pass
             
             try:
-                run_command(f"ltfs -o devname={TAPE_DEVICE} {mount_point}")
-                
                 src = os.path.join(mount_point, rel_path)
                 dst = cache_path
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -344,9 +442,9 @@ class TapeVault(Operations):
             except Exception as e:
                 log.error(f"Error fetching file: {e}")
             finally:
-                run_command(f"umount {mount_point} || fusermount -u {mount_point}")
-                if not in_drive: 
-                     run_command(f"mtx -f {CHANGER_DEVICE} unload {slot_id} 0")
+                if we_mounted_it:
+                    log.info(f"Unmounting {vol_tag}...")
+                    run_command(f"umount {mount_point} || fusermount -u {mount_point}")
 
     def read(self, path, length, offset, fh):
         os.lseek(fh, offset, os.SEEK_SET)
@@ -386,29 +484,53 @@ def index():
     total_free = row[1] if row[1] else 0
     conn.close()
     
+    # Get current status
+    tapes_in_library, drive_loaded = parse_mtx_status()
+    loaded_vol_tag = drive_loaded['vol_tag'] if drive_loaded else None
+    
+    # Check mount status of loaded tape
+    mounted_vol_tag = None
+    if loaded_vol_tag and is_mounted(loaded_vol_tag):
+        mounted_vol_tag = loaded_vol_tag
+        
+    # Get Cache Info
+    cached_files = get_cached_files()
+    # Sort by atime descending (newest accessed first)
+    cached_files.sort(key=lambda x: x['atime'], reverse=True)
+    cache_used = sum(f['size'] for f in cached_files)
+    
     html = """
     <html>
     <head>
         <title>Tape Vault</title>
         <style>
-            body { font-family: Arial, sans-serif; margin: 20px; }
-            table { border-collapse: collapse; width: 100%; }
-            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-            th { background-color: #f2f2f2; }
-            .volume-tag { cursor: pointer; color: #0066cc; text-decoration: underline; }
-            .volume-tag:hover { color: #004499; }
-            .file-tree { margin-left: 20px; display: none; }
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #1e1e1e; color: #e0e0e0; }
+            h1 { color: #ffffff; }
+            h3 { color: #ffffff; border-bottom: 1px solid #444; padding-bottom: 5px; }
+            table { border-collapse: collapse; width: 100%; background-color: #2d2d2d; margin-bottom: 20px; }
+            th, td { border: 1px solid #444; padding: 12px; text-align: left; }
+            th { background-color: #333; color: #ffffff; }
+            a { color: #4da6ff; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+            .volume-tag { cursor: pointer; color: #4da6ff; text-decoration: underline; font-weight: bold; }
+            .volume-tag:hover { color: #80bfff; }
+            .file-tree { margin-left: 20px; display: none; color: #ccc; }
             .file-tree ul { list-style-type: none; padding-left: 20px; }
-            .file-tree li { margin: 2px 0; }
-            .directory { cursor: pointer; color: #0066cc; font-weight: bold; }
-            .directory:hover { color: #004499; }
-            .file { color: #333; }
+            .file-tree li { margin: 4px 0; }
+            .directory { cursor: pointer; color: #ffd700; font-weight: bold; }
+            .directory:hover { color: #ffea70; }
+            .file { color: #e0e0e0; }
             .disk-usage { 
-                background: linear-gradient(to right, #4CAF50 var(--used-percent), #e0e0e0 var(--used-percent)); 
+                background-color: #444;
                 border-radius: 4px; 
                 height: 20px; 
                 position: relative;
                 margin: 2px 0;
+                overflow: hidden;
+            }
+            .disk-usage-bar {
+                height: 100%;
+                background-color: #4CAF50;
             }
             .disk-usage-text { 
                 position: absolute; 
@@ -417,10 +539,48 @@ def index():
                 transform: translate(-50%, -50%); 
                 font-size: 12px;
                 color: white;
-                text-shadow: 1px 1px 1px rgba(0,0,0,0.5);
+                text-shadow: 1px 1px 2px rgba(0,0,0,0.8);
+                white-space: nowrap;
             }
-            .loading { color: #666; font-style: italic; }
-            .summary { margin-bottom: 20px; padding: 15px; background-color: #f8f9fa; border: 1px solid #ddd; border-radius: 4px; }
+            .loading { color: #aaa; font-style: italic; }
+            .summary { margin-bottom: 20px; padding: 15px; background-color: #2d2d2d; border: 1px solid #444; border-radius: 4px; }
+            .btn {
+                display: inline-block;
+                padding: 6px 12px;
+                margin: 2px;
+                font-size: 14px;
+                font-weight: 400;
+                line-height: 1.42857143;
+                text-align: center;
+                white-space: nowrap;
+                vertical-align: middle;
+                cursor: pointer;
+                border: 1px solid transparent;
+                border-radius: 4px;
+                color: #fff;
+                background-color: #337ab7;
+                border-color: #2e6da4;
+            }
+            .btn:hover { background-color: #286090; }
+            .btn-danger { background-color: #d9534f; border-color: #d43f3a; }
+            .btn-danger:hover { background-color: #c9302c; }
+            .btn-success { background-color: #5cb85c; border-color: #4cae4c; }
+            .btn-success:hover { background-color: #449d44; }
+            .btn-warning { background-color: #f0ad4e; border-color: #eea236; }
+            .btn-warning:hover { background-color: #ec971f; }
+            .status-badge {
+                display: inline-block;
+                padding: 3px 7px;
+                font-size: 12px;
+                font-weight: bold;
+                color: #fff;
+                background-color: #777;
+                border-radius: 10px;
+                vertical-align: baseline;
+                margin-left: 5px;
+            }
+            .status-mounted { background-color: #5cb85c; }
+            .cache-list { max-height: 200px; overflow-y: auto; }
         </style>
         <script>
             function toggleVolumeTag(volTag) {
@@ -430,7 +590,6 @@ def index():
                 if (fileTree.style.display === 'none' || fileTree.style.display === '') {
                     fileTree.innerHTML = '<div class="loading">Loading...</div>';
                     fileTree.style.display = 'block';
-                    tag.style.color = '#004499';
                     
                     fetch('/api/files/' + volTag)
                         .then(response => response.json())
@@ -438,11 +597,10 @@ def index():
                             displayFileTree(volTag, data.files, '');
                         })
                         .catch(error => {
-                            fileTree.innerHTML = '<div style="color: red;">Error loading files</div>';
+                            fileTree.innerHTML = '<div style="color: #ff6b6b;">Error loading files</div>';
                         });
                 } else {
                     fileTree.style.display = 'none';
-                    tag.style.color = '#0066cc';
                 }
             }
             
@@ -500,7 +658,7 @@ def index():
                             displayFileTree(volTag, data.files, dirPath);
                         })
                         .catch(error => {
-                            dirElement.innerHTML = '<div style="color: red;">Error loading directory</div>';
+                            dirElement.innerHTML = '<div style="color: #ff6b6b;">Error loading directory</div>';
                         });
                 } else {
                     dirElement.style.display = 'none';
@@ -520,9 +678,43 @@ def index():
         <h1>Tape Vault</h1>
         
         <div class="summary">
+            <h3>Cache Status</h3>
+            <p>
+                <strong>Cache Limit:</strong> {{ cache_limit | filesizeformat }} &nbsp;|&nbsp;
+                <strong>Used:</strong> {{ cache_used | filesizeformat }}
+            </p>
+            <div class="disk-usage" style="margin-bottom: 10px;">
+                {% set cache_percent = (cache_used / cache_limit * 100) if cache_limit > 0 else 0 %}
+                <div class="disk-usage-bar" style="width: {{ cache_percent }}%"></div>
+                <div class="disk-usage-text">{{ "%.1f"|format(cache_percent) }}%</div>
+            </div>
+            <h4>Cached Files:</h4>
+            <div class="cache-list">
+                <table style="font-size: 12px; margin-bottom: 0;">
+                    <tr>
+                        <th>Path</th>
+                        <th>Size</th>
+                        <th>Last Accessed</th>
+                    </tr>
+                    {% for f in cached_files %}
+                    <tr>
+                        <td>{{ f.path }}</td>
+                        <td>{{ f.size | filesizeformat }}</td>
+                        <td>{{ f.atime | timestamp_to_time }}</td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="3">No files in cache.</td></tr>
+                    {% endfor %}
+                </table>
+            </div>
+        </div>
+        
+        <div class="summary">
             <h3>System Status</h3>
-            <p><strong>Total Capacity:</strong> {{ total_capacity | filesizeformat }}</p>
-            <p><strong>Total Free Space:</strong> {{ total_free | filesizeformat }}</p>
+            <p>
+                <strong>Total Capacity:</strong> {{ total_capacity | filesizeformat }} &nbsp;|&nbsp; 
+                <strong>Total Free Space:</strong> {{ total_free | filesizeformat }}
+            </p>
         </div>
 
         <table border="1">
@@ -539,21 +731,32 @@ def index():
                     <span id="tag-{{ tape.vol_tag }}" class="volume-tag" onclick="toggleVolumeTag('{{ tape.vol_tag }}')">
                         {{ tape.vol_tag }}
                     </span>
+                    {% if tape.vol_tag == mounted_vol_tag %}
+                        <span class="status-badge status-mounted">MOUNTED</span>
+                    {% endif %}
                 </td>
                 <td>
                     {% set used_space = tape.total_space - tape.free_space %}
                     {% set used_percent = (used_space / tape.total_space * 100) if tape.total_space > 0 else 0 %}
-                    <div class="disk-usage" style="--used-percent: {{ used_percent }}%">
+                    <div class="disk-usage">
+                        <div class="disk-usage-bar" style="width: {{ used_percent }}%"></div>
                         <div class="disk-usage-text">{{ "%.1f"|format(used_percent) }}% used</div>
                     </div>
                 </td>
                 <td>
-                    Total: {{ "%0.1f"|format((tape.total_space / (1024*1024*1024))) }} GB<br>
-                    Used: {{ "%0.1f"|format(((tape.total_space - tape.free_space) / (1024*1024*1024))) }} GB<br>
+                    Total: {{ "%0.1f"|format((tape.total_space / (1024*1024*1024))) }} GB | 
+                    Used: {{ "%0.1f"|format(((tape.total_space - tape.free_space) / (1024*1024*1024))) }} GB | 
                     Free: {{ "%0.1f"|format((tape.free_space / (1024*1024*1024))) }} GB
                 </td>
-                <td>{{ tape.last_seen }}</td>
-                <td><a href="/delete/{{ tape.vol_tag }}">Delete</a></td>
+                <td>{{ tape.last_seen | timestamp_to_time }}</td>
+                <td>
+                    {% if tape.vol_tag == mounted_vol_tag %}
+                        <a href="/unmount/{{ tape.vol_tag }}" class="btn btn-warning">Unmount</a>
+                    {% else %}
+                        <a href="/mount/{{ tape.vol_tag }}" class="btn btn-success">Mount</a>
+                    {% endif %}
+                    <a href="/delete/{{ tape.vol_tag }}" class="btn btn-danger" onclick="return confirm('Are you sure you want to delete this tape from the database?')">Delete</a>
+                </td>
             </tr>
             <tr>
                 <td colspan="5" style="padding: 0;">
@@ -565,26 +768,89 @@ def index():
     </body>
     </html>
     """
-    return render_template_string(html, tapes=tapes, total_capacity=total_capacity, total_free=total_free)
+    
+    # Helper for timestamp formatting in template
+    def timestamp_to_time(ts):
+        return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
+    
+    # Add filter to jinja env (hacky way for render_template_string)
+    app.jinja_env.filters['timestamp_to_time'] = timestamp_to_time
+    
+    return render_template_string(html, tapes=tapes, total_capacity=total_capacity, total_free=total_free, 
+                                  mounted_vol_tag=mounted_vol_tag, 
+                                  cached_files=cached_files, cache_used=cache_used, cache_limit=CACHE_SIZE_LIMIT)
+
+@app.route('/mount/<vol_tag>')
+def mount_tape(vol_tag):
+    with TAPE_LOCK:
+        # Check if already mounted
+        if is_mounted(vol_tag):
+            return redirect(url_for('index'))
+            
+        # Unmount any other tape
+        # We need to find if any other tape is mounted
+        # Since we don't track it easily, we can just check all tapes or check mtx status
+        # Simplest is to check if drive is loaded and if that tape is mounted
+        tapes_in_library, drive_loaded = parse_mtx_status()
+        if drive_loaded:
+            current_vol = drive_loaded['vol_tag']
+            if is_mounted(current_vol):
+                log.info(f"Unmounting currently mounted tape {current_vol}...")
+                mount_point = os.path.join(TEMP_MOUNT_BASE, current_vol)
+                run_command(f"umount {mount_point} || fusermount -u {mount_point}")
+            
+            if current_vol != vol_tag:
+                log.info(f"Unloading {current_vol}...")
+                run_command(f"mtx -f {CHANGER_DEVICE} unload || true")
+        
+        # Load target tape
+        slot_id = None
+        for s, v in tapes_in_library.items():
+            if v == vol_tag:
+                slot_id = s
+                break
+        
+        if not slot_id and (not drive_loaded or drive_loaded['vol_tag'] != vol_tag):
+             return f"Error: Tape {vol_tag} not found in library", 404
+             
+        if not drive_loaded or drive_loaded['vol_tag'] != vol_tag:
+            log.info(f"Loading tape {vol_tag} from slot {slot_id}...")
+            run_command(f"mtx -f {CHANGER_DEVICE} load {slot_id} 0")
+            
+        # Mount
+        mount_point = os.path.join(TEMP_MOUNT_BASE, vol_tag)
+        if not os.path.exists(mount_point):
+            os.makedirs(mount_point)
+            
+        log.info(f"Mounting {vol_tag}...")
+        run_command(f"ltfs -o devname={TAPE_DEVICE} {mount_point}")
+        
+    return redirect(url_for('index'))
+
+@app.route('/unmount/<vol_tag>')
+def unmount_tape(vol_tag):
+    with TAPE_LOCK:
+        if is_mounted(vol_tag):
+            log.info(f"Unmounting {vol_tag}...")
+            mount_point = os.path.join(TEMP_MOUNT_BASE, vol_tag)
+            run_command(f"umount {mount_point} || fusermount -u {mount_point}")
+            
+        # Unload
+        log.info(f"Unloading {vol_tag}...")
+        run_command(f"mtx -f {CHANGER_DEVICE} unload || true")
+        
+    return redirect(url_for('index'))
 
 @app.route('/browse/<vol_tag>/')
 @app.route('/browse/<vol_tag>/<path:subpath>')
 def browse(vol_tag, subpath=""):
     conn = get_db_connection()
     
-    # We want to list files in this directory for this tape
-    # But we merged the namespace in FUSE.
-    # The requirement says "browse thier directories from the databse".
-    # So we can show files belonging to this tape.
-    
-    # If subpath is empty, list root of tape
     if subpath:
         prefix = subpath + '/'
     else:
         prefix = ""
         
-    # Find direct children in this tape
-    # We use the same logic as readdir but filtered by vol_tag
     c = conn.cursor()
     c.execute("SELECT path, size FROM files WHERE vol_tag=? AND path LIKE ?", (vol_tag, prefix + '%'))
     
@@ -597,23 +863,32 @@ def browse(vol_tag, subpath=""):
         parts = remainder.split('/')
         
         if len(parts) == 1:
-            # It's a file
             files.append({'name': parts[0], 'size': row['size'], 'path': p})
         else:
-            # It's a directory
             dirs.add(parts[0])
             
     conn.close()
     
     html = """
     <html>
-    <head><title>Browse {{ vol_tag }}</title></head>
+    <head>
+        <title>Browse {{ vol_tag }}</title>
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #1e1e1e; color: #e0e0e0; }
+            h1 { color: #ffffff; }
+            a { color: #4da6ff; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+            ul { list-style-type: none; padding-left: 20px; }
+            li { margin: 5px 0; }
+            .directory { color: #ffd700; font-weight: bold; }
+        </style>
+    </head>
     <body>
         <h1>Browse {{ vol_tag }}: /{{ subpath }}</h1>
-        <a href="/">Back to Tapes</a>
+        <p><a href="/">Back to Tapes</a></p>
         <ul>
             {% for d in dirs %}
-            <li><a href="/browse/{{ vol_tag }}/{{ subpath + '/' + d if subpath else d }}">{{ d }}/</a></li>
+            <li><a href="/browse/{{ vol_tag }}/{{ subpath + '/' + d if subpath else d }}" class="directory">{{ d }}/</a></li>
             {% endfor %}
             {% for f in files %}
             <li>{{ f.name }} ({{ f.size | filesizeformat }})</li>
@@ -657,6 +932,21 @@ def api_files(vol_tag):
 def start_web_server():
     app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)
 
+def cleanup():
+    """Cleanup function to run on shutdown."""
+    log.info("Shutting down... cleaning up.")
+    # Unmount any LTFS mounts
+    if os.path.exists(TEMP_MOUNT_BASE):
+        for vol in os.listdir(TEMP_MOUNT_BASE):
+            mp = os.path.join(TEMP_MOUNT_BASE, vol)
+            if os.path.ismount(mp):
+                log.info(f"Unmounting {mp}...")
+                subprocess.run(f"umount {mp} || fusermount -u {mp}", shell=True)
+    
+    # Unload drive
+    log.info("Unloading drive...")
+    subprocess.run(f"mtx -f {CHANGER_DEVICE} unload", shell=True)
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--mount-point', default='/mnt/tape-vault')
@@ -675,4 +965,9 @@ if __name__ == '__main__':
         os.makedirs(args.mount_point)
         
     log.info(f"Starting FUSE filesystem at {args.mount_point}")
-    fuse = FUSE(TapeVault(), args.mount_point, foreground=True, allow_other=True)
+    try:
+        fuse = FUSE(TapeVault(), args.mount_point, foreground=True, allow_other=True)
+    except Exception as e:
+        log.error(f"FUSE error: {e}")
+    finally:
+        cleanup()
