@@ -24,6 +24,8 @@ WEB_PORT = int(os.environ.get('WEB_PORT', 5002))
 # CACHE_SIZE_LIMIT is in GB
 CACHE_SIZE_LIMIT_GB = int(os.environ.get('CACHE_SIZE_LIMIT', 50))
 CACHE_SIZE_LIMIT = CACHE_SIZE_LIMIT_GB * 1024 * 1024 * 1024
+MIN_FILE_SIZE_MB = int(os.environ.get('MIN_FILE_SIZE_MB', 100))
+MIN_FILE_SIZE_BYTES = MIN_FILE_SIZE_MB * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 log = logging.getLogger('tapevault')
@@ -32,6 +34,223 @@ app = Flask(__name__)
 
 # Global lock for tape operations
 TAPE_LOCK = threading.Lock()
+
+# Ingestion Manager
+class IngestManager:
+    def __init__(self):
+        self.job_queue = []
+        self.current_job = None
+        self.history = []
+        self.lock = threading.Lock()
+        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self.worker_thread.start()
+
+    def add_job(self, job_data):
+        with self.lock:
+            job_id = str(int(time.time() * 1000))
+            job = {
+                'id': job_id,
+                'status': 'pending',
+                'type': job_data['type'], # 'tv' or 'movie'
+                'source_path': job_data['source_path'],
+                'action': job_data['action'], # 'copy', 'move', 'link'
+                'progress': 0,
+                'message': 'Queued',
+                'timestamp': time.time()
+            }
+            self.job_queue.append(job)
+            return job_id
+
+    def get_status(self):
+        with self.lock:
+            return {
+                'queue': self.job_queue,
+                'current': self.current_job,
+                'history': self.history[-10:] # Keep last 10
+            }
+
+    def _worker(self):
+        while True:
+            job = None
+            with self.lock:
+                if self.job_queue:
+                    job = self.job_queue.pop(0)
+                    self.current_job = job
+            
+            if job:
+                try:
+                    self._process_job(job)
+                except Exception as e:
+                    log.error(f"Job failed: {e}")
+                    job['status'] = 'failed'
+                    job['message'] = str(e)
+                finally:
+                    with self.lock:
+                        job['end_time'] = time.time()
+                        self.history.append(job)
+                        self.current_job = None
+            else:
+                time.sleep(1)
+
+    def _process_job(self, job):
+        job['status'] = 'running'
+        job['message'] = 'Calculating size...'
+        
+        source_path = job['source_path']
+        job_type = job['type']
+        action = job['action']
+        
+        # Calculate size of eligible files
+        total_size = 0
+        files_to_copy = []
+        
+        for root, dirs, files in os.walk(source_path):
+            for name in files:
+                fpath = os.path.join(root, name)
+                try:
+                    size = os.path.getsize(fpath)
+                    if size >= MIN_FILE_SIZE_BYTES:
+                        total_size += size
+                        files_to_copy.append((fpath, size))
+                except OSError:
+                    pass
+        
+        if total_size == 0:
+            job['message'] = 'No eligible files found (> {} MB)'.format(MIN_FILE_SIZE_MB)
+            job['status'] = 'completed'
+            return
+
+        job['message'] = f'Finding tape for {len(files_to_copy)} files ({total_size / (1024*1024*1024):.2f} GB)...'
+        
+        # Find best tape
+        # Need 1GB buffer
+        needed_space = total_size + (1 * 1024 * 1024 * 1024)
+        
+        conn = get_db_connection()
+        # Find tapes with enough free space, order by free_space ASC (fill fullest first)
+        tapes = conn.execute("SELECT vol_tag, free_space FROM tapes WHERE free_space > ? ORDER BY free_space ASC", (needed_space,)).fetchall()
+        conn.close()
+        
+        if not tapes:
+            raise Exception("No tape found with enough free space.")
+            
+        target_vol = tapes[0]['vol_tag']
+        job['message'] = f'Selected tape {target_vol}. Mounting...'
+        
+        # Mount Tape (Write Mode)
+        # We need to use the global TAPE_LOCK to ensure exclusive access
+        with TAPE_LOCK:
+            # Check if already mounted
+            if not is_mounted(target_vol):
+                # Unmount/Unload others
+                tapes_in_library, drive_loaded = parse_mtx_status()
+                if drive_loaded and drive_loaded['vol_tag'] != target_vol:
+                    if is_mounted(drive_loaded['vol_tag']):
+                        mp = os.path.join(TEMP_MOUNT_BASE, drive_loaded['vol_tag'])
+                        run_command(f"umount {mp} || fusermount -u {mp}")
+                    run_command(f"mtx -f {CHANGER_DEVICE} unload || true")
+                
+                # Load if needed
+                if not drive_loaded or drive_loaded['vol_tag'] != target_vol:
+                    slot_id = None
+                    for s, v in tapes_in_library.items():
+                        if v == target_vol:
+                            slot_id = s
+                            break
+                    if not slot_id:
+                         raise Exception(f"Tape {target_vol} not found in library")
+                    run_command(f"mtx -f {CHANGER_DEVICE} load {slot_id} 0")
+                
+                # Mount
+                mount_point = os.path.join(TEMP_MOUNT_BASE, target_vol)
+                os.makedirs(mount_point, exist_ok=True)
+                run_command(f"ltfs -o devname={TAPE_DEVICE} {mount_point}")
+            else:
+                mount_point = os.path.join(TEMP_MOUNT_BASE, target_vol)
+
+            try:
+                # Determine Destination
+                # TV: mount_point/TV/{ShowName}/...
+                # Movie: mount_point/Movies/{MovieName}/...
+                folder_name = os.path.basename(source_path.rstrip('/'))
+                if job_type == 'tv':
+                    dest_base = os.path.join(mount_point, 'TV', folder_name)
+                else:
+                    dest_base = os.path.join(mount_point, 'Movies', folder_name)
+                
+                copied_bytes = 0
+                for i, (src, size) in enumerate(files_to_copy):
+                    rel_path = os.path.relpath(src, source_path)
+                    dst = os.path.join(dest_base, rel_path)
+                    
+                    job['message'] = f'Copying {i+1}/{len(files_to_copy)}: {os.path.basename(src)}'
+                    job['progress'] = int((copied_bytes / total_size) * 100)
+                    
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    
+                    import shutil
+                    shutil.copy2(src, dst)
+                    copied_bytes += size
+                    
+                    # Post-copy action
+                    if action == 'move':
+                        os.remove(src)
+                        # Try removing empty dirs
+                        try:
+                            os.removedirs(os.path.dirname(src))
+                        except OSError:
+                            pass
+                    elif action == 'link':
+                        os.remove(src)
+                        # Create symlink to FUSE path
+                        # FUSE path: /mnt/tape-vault/...
+                        # We need to construct the path relative to the FUSE mount
+                        # The file on tape is at: dest_base/rel_path
+                        # dest_base is e.g. /tmp/ltfs_mounts/VOL123/TV/Show...
+                        # relative to mount point: TV/Show...
+                        tape_rel_path = os.path.relpath(dst, mount_point)
+                        fuse_path = os.path.join('/mnt/tape-vault', tape_rel_path) # Assuming standard mount
+                        os.symlink(fuse_path, src)
+
+                job['message'] = 'Indexing tape...'
+                # Re-index
+                # We can call index_tape logic, but we are already mounted.
+                # Just run the indexing part.
+                
+                # Get disk usage
+                st = os.statvfs(mount_point)
+                total_space = st.f_blocks * st.f_frsize
+                free_space = st.f_bavail * st.f_frsize
+                
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute("DELETE FROM files WHERE vol_tag=?", (target_vol,))
+                
+                count = 0
+                for root, dirs, files in os.walk(mount_point):
+                    for name in files:
+                        fpath = os.path.join(root, name)
+                        rel_path = os.path.relpath(fpath, mount_point)
+                        stat = os.stat(fpath)
+                        c.execute("INSERT INTO files (vol_tag, path, size, mtime) VALUES (?, ?, ?, ?)",
+                                  (target_vol, rel_path, stat.st_size, int(stat.st_mtime)))
+                        count += 1
+                
+                c.execute("INSERT OR REPLACE INTO tapes (vol_tag, last_seen, total_space, free_space) VALUES (?, ?, ?, ?)", 
+                          (target_vol, int(time.time()), total_space, free_space))
+                conn.commit()
+                conn.close()
+                
+                job['status'] = 'completed'
+                job['message'] = 'Completed successfully.'
+                job['progress'] = 100
+                
+            finally:
+                # Unmount
+                job['message'] = 'Unmounting...'
+                run_command(f"umount {mount_point} || fusermount -u {mount_point}")
+
+ingest_manager = IngestManager()
 
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -472,7 +691,8 @@ class TapeVault(Operations):
 @app.route('/')
 def index():
     conn = get_db_connection()
-    tapes = conn.execute('SELECT * FROM tapes').fetchall()
+    # Sort by used space descending (total_space - free_space)
+    tapes = conn.execute('SELECT * FROM tapes ORDER BY (total_space - free_space) DESC').fetchall()
     conn.close()
     
     # Calculate total stats
@@ -678,6 +898,23 @@ def index():
         <h1>Tape Vault</h1>
         
         <div class="summary">
+            <h3>Ingestion Status</h3>
+            {% if ingest_status.current %}
+                <div style="background: #444; padding: 10px; border-radius: 4px; margin-bottom: 10px;">
+                    <strong>Running:</strong> {{ ingest_status.current.type | upper }} - {{ ingest_status.current.source_path }}<br>
+                    Status: {{ ingest_status.current.message }}<br>
+                    <div class="disk-usage" style="margin-top: 5px;">
+                        <div class="disk-usage-bar" style="width: {{ ingest_status.current.progress }}%"></div>
+                    </div>
+                </div>
+            {% endif %}
+            {% if ingest_status.queue %}
+                <p><strong>Queued:</strong> {{ ingest_status.queue | length }} jobs</p>
+            {% endif %}
+            <a href="/ingest" class="btn btn-success">Add Files to Tape Vault</a>
+        </div>
+
+        <div class="summary">
             <h3>Cache Status</h3>
             <p>
                 <strong>Cache Limit:</strong> {{ cache_limit | filesizeformat }} &nbsp;|&nbsp;
@@ -778,7 +1015,8 @@ def index():
     
     return render_template_string(html, tapes=tapes, total_capacity=total_capacity, total_free=total_free, 
                                   mounted_vol_tag=mounted_vol_tag, 
-                                  cached_files=cached_files, cache_used=cache_used, cache_limit=CACHE_SIZE_LIMIT)
+                                  cached_files=cached_files, cache_used=cache_used, cache_limit=CACHE_SIZE_LIMIT,
+                                  ingest_status=ingest_manager.get_status())
 
 @app.route('/mount/<vol_tag>')
 def mount_tape(vol_tag):
@@ -908,6 +1146,146 @@ def delete_tape(vol_tag):
     conn.close()
     return redirect(url_for('index'))
 
+@app.route('/ingest')
+def ingest_page():
+    return render_template_string("""
+    <html>
+    <head>
+        <title>Tape Vault - Add Files</title>
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background-color: #1e1e1e; color: #e0e0e0; }
+            h1, h2 { color: #ffffff; }
+            .container { display: flex; gap: 20px; }
+            .file-browser { flex: 1; background: #2d2d2d; padding: 15px; border-radius: 4px; height: 600px; overflow-y: auto; }
+            .settings { flex: 1; background: #2d2d2d; padding: 15px; border-radius: 4px; }
+            ul { list-style: none; padding-left: 20px; }
+            li { margin: 5px 0; cursor: pointer; }
+            .dir-icon { color: #ffd700; margin-right: 5px; }
+            .selected { background-color: #337ab7; color: white; }
+            .btn { padding: 10px 20px; background: #337ab7; color: white; border: none; cursor: pointer; border-radius: 4px; }
+            .btn:hover { background: #286090; }
+            input[type="radio"] { margin-right: 5px; }
+            label { display: block; margin: 10px 0; }
+        </style>
+        <script>
+            let currentPath = '/';
+            let selectedPath = null;
+
+            function loadFiles(path) {
+                currentPath = path;
+                fetch('/api/server-files?path=' + encodeURIComponent(path))
+                    .then(r => r.json())
+                    .then(data => {
+                        const list = document.getElementById('file-list');
+                        list.innerHTML = '';
+                        
+                        // Up directory
+                        if (path !== '/') {
+                            const upLi = document.createElement('li');
+                            upLi.innerHTML = '<span class="dir-icon">📁</span> ..';
+                            upLi.onclick = () => {
+                                const parts = path.split('/').filter(p => p);
+                                parts.pop();
+                                loadFiles('/' + parts.join('/'));
+                            };
+                            list.appendChild(upLi);
+                        }
+
+                        data.dirs.forEach(d => {
+                            const li = document.createElement('li');
+                            li.innerHTML = `<span class="dir-icon">📁</span> ${d}`;
+                            li.onclick = (e) => {
+                                e.stopPropagation();
+                                loadFiles(path === '/' ? '/' + d : path + '/' + d);
+                            };
+                            
+                            // Selection logic
+                            const selectBtn = document.createElement('span');
+                            selectBtn.innerText = ' [SELECT]';
+                            selectBtn.style.fontSize = '0.8em';
+                            selectBtn.style.color = '#aaa';
+                            selectBtn.onclick = (e) => {
+                                e.stopPropagation();
+                                selectPath(path === '/' ? '/' + d : path + '/' + d);
+                            };
+                            li.appendChild(selectBtn);
+                            
+                            list.appendChild(li);
+                        });
+                    });
+            }
+
+            function selectPath(path) {
+                selectedPath = path;
+                document.getElementById('selected-path-display').innerText = path;
+            }
+
+            function submitJob() {
+                if (!selectedPath) {
+                    alert('Please select a folder first.');
+                    return;
+                }
+                
+                const type = document.querySelector('input[name="type"]:checked').value;
+                const action = document.querySelector('input[name="action"]:checked').value;
+                
+                fetch('/api/ingest', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        source_path: selectedPath,
+                        type: type,
+                        action: action
+                    })
+                }).then(r => r.json()).then(data => {
+                    if (data.status === 'ok') {
+                        alert('Job started!');
+                        window.location.href = '/';
+                    } else {
+                        alert('Error: ' + data.message);
+                    }
+                });
+            }
+
+            window.onload = () => loadFiles('/');
+        </script>
+    </head>
+    <body>
+        <h1>Add Files to Tape Vault</h1>
+        <p><a href="/" style="color: #4da6ff;">&larr; Back to Dashboard</a></p>
+        
+        <div class="container">
+            <div class="file-browser">
+                <h3>Server Files</h3>
+                <ul id="file-list"></ul>
+            </div>
+            <div class="settings">
+                <h3>Configuration</h3>
+                <p><strong>Selected Folder:</strong> <span id="selected-path-display" style="color: #4da6ff;">None</span></p>
+                
+                <hr>
+                <h4>Content Type</h4>
+                <label><input type="radio" name="type" value="tv" checked> TV Show (Folder contains seasons)</label>
+                <label><input type="radio" name="type" value="movie"> Movie (Folder is the movie title)</label>
+                
+                <hr>
+                <h4>Action</h4>
+                <label><input type="radio" name="action" value="copy" checked> Copy Only (Keep originals)</label>
+                <label><input type="radio" name="action" value="move"> Move (Delete originals > 100MB)</label>
+                <label><input type="radio" name="action" value="link"> Link (Replace originals with symlink)</label>
+                
+                <hr>
+                <button class="btn" onclick="submitJob()">Start Ingestion</button>
+                
+                <p style="margin-top: 20px; font-size: 0.9em; color: #aaa;">
+                    Note: Only files larger than {{ min_size }} MB will be processed.
+                </p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """, min_size=MIN_FILE_SIZE_MB)
+
 @app.route('/api/files/<vol_tag>')
 def api_files(vol_tag):
     conn = get_db_connection()
@@ -928,6 +1306,30 @@ def api_files(vol_tag):
     conn.close()
     
     return {'files': files}
+
+@app.route('/api/server-files')
+def api_server_files():
+    path = request.args.get('path', '/')
+    if not os.path.exists(path) or not os.path.isdir(path):
+        return {'error': 'Invalid path'}, 400
+        
+    try:
+        items = os.listdir(path)
+        dirs = [d for d in items if os.path.isdir(os.path.join(path, d))]
+        dirs.sort()
+        return {'dirs': dirs}
+    except Exception as e:
+        return {'error': str(e)}, 500
+
+@app.route('/api/ingest', methods=['POST'])
+def api_ingest():
+    data = request.json
+    try:
+        job_id = ingest_manager.add_job(data)
+        return {'status': 'ok', 'job_id': job_id}
+    except Exception as e:
+        return {'status': 'error', 'message': str(e)}
+
 
 def start_web_server():
     app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)

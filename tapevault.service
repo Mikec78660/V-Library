@@ -9,6 +9,7 @@ Environment=TAPE_DEVICE=/dev/st0
 Environment=DB_PATH=/var/lib/tapevault/tapevault.db
 Environment=TEMP_MOUNT_BASE=/tmp/ltfs_mounts
 Environment=CACHE_SIZE_LIMIT=50
+Environment=MIN_FILE_SIZE_MB=100
 # Ensure python output is unbuffered so logs show up immediately in journal
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/V-library/tapevault.py --mount-point /mnt/tape-vault
